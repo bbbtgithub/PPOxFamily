@@ -2,7 +2,7 @@ import torch
 import gym
 from typing import Callable, Optional, Dict, Tuple
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
-
+from lm_env2 import calculate_perplexity, TextEnvironment
 # Your existing environment code here...
 
 def test_env():
@@ -53,3 +53,9 @@ def test_env():
 
 if __name__ == '__main__':
     test_env()
+
+
+#网上直接去找数据集，不要动作池，语言的公开数据集
+#demo
+#较小数据规模
+#自由输出

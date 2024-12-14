@@ -29,7 +29,7 @@ def select_action(policy, state, action_pool):
     return action, action_probs[action_idx]
 
 
-def compute_returns(rewards, gamma=0.99):
+def compute_returns(rewards, gamma=0.95):
     R = 0
     returns = []
     for r in reversed(rewards):
@@ -38,7 +38,8 @@ def compute_returns(rewards, gamma=0.99):
     return returns
 
 
-def train_policy_gradient(env, policy, optimizer, action_pool, episodes, gamma=0.95):#从0.99改成0.95，能多训练几轮
+def train_policy_gradient(env, policy, optimizer, action_pool, episodes, gamma=0.95):
+  #从0.99改成0.95，能多训练几轮，0.99很容易出现nan
     for episode in range(episodes):
         state, _ = env.reset()
         log_probs = []
@@ -104,7 +105,8 @@ def main():
         "Explain reinforcement learning.",
         "Generate a poem."
     ]
-    """是否可以实现无动作池的自由生成？
+    """
+    是否可以实现无动作池的自由生成？
     是可以的，但需要更复杂的设计：
 
     自由文本生成：

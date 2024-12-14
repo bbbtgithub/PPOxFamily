@@ -5,7 +5,8 @@ import numpy as np
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from typing import Callable, Dict, Optional, Tuple
 from lm_env2 import calculate_perplexity, TextEnvironment
-
+import traceback
+import argparse
 # 定义一个Actor-Critic模型，用于 PPO 算法
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim, action_dim):
@@ -24,15 +25,17 @@ class ActorCritic(nn.Module):
             nn.Linear(128, 1)  # 隐藏层到标量输出的线性变换
         )
 
-    def forward(self, x):
-        # 前向传播，输出动作概率和状态值
+    def forward(self, x, attention_mask=None):
+        # 如果需要，可以利用 attention_mask 做加权处理
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1)  # 对输入加权
         probs = self.actor(x)  # 动作概率
         value = self.critic(x)  # 状态值
         return probs, value
 
 # PPO（近端策略优化）代理类
 class PPOAgent:
-    def __init__(self, obs_dim, action_dim, lr=0.0003, gamma=0.99, lam=0.95, epsilon=0.2):
+    def __init__(self, obs_dim, action_dim, lr=0.003, gamma=0.99, lam=0.95, epsilon=0.2):
         self.gamma = gamma  # 折扣因子，用于计算回报
         self.lam = lam  # GAE（广义优势估计）中的 lambda 参数
         self.epsilon = epsilon  # PPO 中的截断范围
@@ -41,6 +44,7 @@ class PPOAgent:
         self.model = ActorCritic(obs_dim, action_dim)
         # 使用 Adam 优化器
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+    #实际上并不需要剪裁
     def pad_or_crop(self, tensor, target_length):
         """将 tensor 填充或裁剪为目标长度"""
         current_length = tensor.shape[0]
@@ -98,12 +102,23 @@ class PPOAgent:
         """
         for _ in range(10):  # 对每批数据进行多次更新
             probs, values = self.model(states)  # 前向传播获取动作概率和状态值
+            
             probs_a = probs.gather(1, actions.unsqueeze(1)).squeeze(1)  # 获取执行动作的概率
+            
             ratio = probs_a / (old_probs + 1e-8)  # 计算重要性采样比率
             # PPO 的截断机制，限制比率的变化范围
             clip_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon)
             # 计算 Actor 损失
             actor_loss = -torch.min(ratio * advantages, clip_ratio * advantages).mean()
+            """
+            log_ratio = torch.log(probs_a + 1e-8) - torch.log(old_probs + 1e-8)  # 计算对数比率
+            clip_log_ratio = torch.clamp(
+                log_ratio,
+                torch.log(torch.tensor(1 - self.epsilon, dtype=torch.float32)),
+                torch.log(torch.tensor(1 + self.epsilon, dtype=torch.float32))
+            )# 截断对数比率
+            actor_loss = -torch.min(log_ratio * advantages, clip_log_ratio * advantages).mean()
+            """
             # 计算 Critic 损失
             value_loss = (returns - values.squeeze(1)).pow(2).mean()
             # 总损失 = Actor 损失 + Critic 损失
@@ -113,10 +128,11 @@ class PPOAgent:
             self.optimizer.zero_grad()
             loss.backward()
             # 添加梯度裁剪
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
     def train_step(self, env, batch_size=64):
+        #traceback.print_stack()  # 打印调用堆栈
         """
         从环境中收集数据并进行训练
         """
@@ -131,11 +147,16 @@ class PPOAgent:
             query = tokenizer.decode([action])  # 动作解码为 query（例如 Token 转字符串）
             obs, reward, done, info = env.step(query)  # 将 query 传递给环境，获取下一个状态、奖励和终止标志
         print("Obs:", obs)
+        #print("train_step() was called.")  # 添加调试信息
+        
+        #全连接网络内部可能出现nan 导致logits出现nan,以下的处理感觉没有必要
+        """
         assert not np.isnan(obs).any(), "Obs contains NaN values"
         assert not np.isinf(obs).any(), "Obs contains Inf values"
         
         obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)  # 替换 NaN 和 Inf
         obs = np.clip(obs, -1e6, 1e6)  # 限制值的范围
+        """
         # 收集批量数据
         while len(states) < batch_size:
             action, prob = self.select_action(obs)  # 选择动作
@@ -151,7 +172,7 @@ class PPOAgent:
             obs = next_obs if not done else env.reset()[0]  # 如果未终止，则更新状态，否则重置
             
             obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)  # 替换 NaN 和 Inf
-            obs = np.clip(obs, -1e6, 1e6)  # 限制值的范围
+            obs = np.clip(obs, 0, 5e4)  # 限制值的范围
             
         # 计算优势和回报
         advantages, returns = self.compute_advantages(rewards, dones, values)
@@ -178,42 +199,64 @@ class PPOAgent:
             advantages,  # 优势
             returns  # 回报
         )
+        
 
-# 加载 GPT-2 模型和 Tokenizer
-tokenizer = GPT2Tokenizer.from_pretrained('gpt2')  # 加载 GPT-2 的分词器
-tokenizer.pad_token = tokenizer.eos_token  # 将 padding token 设置为 eos token
-model = GPT2LMHeadModel.from_pretrained('gpt2')  # 加载 GPT-2 模型
+
 
 # 定义奖励函数：负困惑度
 def reward_function(model, query, response):
     return -calculate_perplexity(model, query, response)  # 计算困惑度的负值作为奖励
 
-# 定义生成参数
-generation_kwargs = {
-    'max_new_tokens': 20,  # 最大生成的 Token 数
-    'do_sample': True,  # 使用采样生成
-    'temperature': 0.7,  # 温度参数，控制生成的多样性
-    'repetition_penalty': 2.0  # 重复惩罚
-}
 
-# 初始化文本环境
-env = TextEnvironment(
-    model=model,  # GPT-2 模型
-    tokenizer=tokenizer,  # 分词器
-    reward_fn=reward_function,  # 奖励函数
-    max_turns=3,  # 最大对话轮数
-    generation_kwargs=generation_kwargs  # 文本生成参数
-)
 
-# 初始化 PPO 代理
-ppo = PPOAgent(
-    obs_dim=1024,  # 观测空间大小，与 Tokenizer vocab 相符
-    action_dim=tokenizer.vocab_size  # 动作空间大小，即 Tokenizer 词汇表大小
-)
+if __name__ == '__main__':
+    
+    # 添加参数支持
+    parser = argparse.ArgumentParser(description="PPO Training Script")
+    parser.add_argument('--train', action='store_true', help="Run training")
+    args = parser.parse_args()
 
-# 开始训练 PPO
-for episode in range(500):  # 训练 500 次
-    ppo.train_step(env)  # 每次训练一个批次的数据
-    if episode % 50 == 0:  # 每 50 次输出进度
-        print(f"Episode {episode} complete.")  # 输出当前训练完成的轮数
-    print(f"Episode {episode} complete.")  # 重复打印（意外多加了一次）
+
+        
+            # 加载 GPT-2 模型和 Tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')  # 加载 GPT-2 的分词器
+    tokenizer.pad_token = tokenizer.eos_token  # 将 padding token 设置为 eos token
+    model = GPT2LMHeadModel.from_pretrained('gpt2')  # 加载 GPT-2 模型
+    # 定义生成参数
+    generation_kwargs = {
+        'max_new_tokens': 20,  # 最大生成的 Token 数
+        'do_sample': True,  # 使用采样生成
+        'temperature': 0.7,  # 温度参数，控制生成的多样性
+        'repetition_penalty': 2.0  # 重复惩罚
+    }
+
+    # 初始化文本环境
+    env = TextEnvironment(
+        model=model,  # GPT-2 模型
+        tokenizer=tokenizer,  # 分词器
+        reward_fn=reward_function,  # 奖励函数
+        max_turns=3,  # 最大对话轮数
+        generation_kwargs=generation_kwargs  # 文本生成参数
+    )
+
+    # 初始化 PPO 代理
+    ppo = PPOAgent(
+        obs_dim=8,  # 观测空间大小，与 Tokenizer vocab 相符 
+        action_dim=tokenizer.vocab_size  # 动作空间大小，即 Tokenizer 词汇表大小
+    )
+
+
+    # 开始训练 PPO
+    if args.train:
+        for episode in range(10):  # 训练 500 次
+            ppo.train_step(env)  # 每次训练一个批次的数据
+            torch.save(ppo.model.state_dict(), 'ppo_actor_critic.pth')  # 保存模型参数
+            print("Model saved.")
+            """
+            if episode % 50 == 0:  # 每 50 次输出进度
+                print(f"Episode {episode} complete.")  # 输出当前训练完成的轮数"""
+            print(f"Episode {episode} complete.")  # 重复打印（意外多加了一次）
+    else:
+        print("Training script loaded. Use --train to start training.")
+            
+    
